@@ -1,125 +1,96 @@
 #!/usr/bin/env python3
 import asyncio
+import nest_asyncio
 import os
-import shutil
 import tempfile
-from pathlib import Path
-
-import nest_asyncio  # для PyCharm
-nest_asyncio.apply()  # дозволяє вкладати event loop всередині PyCharm
-
+import yt_dlp
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
 
-# ===== CONFIG =====
-TELEGRAM_TOKEN = "8071411122:AAE7qfXVzvR-LIhlelQ8RHl0PKpLQF2M4mA"
-YTDLP_CMD = "yt-dlp.exe" if Path("yt-dlp.exe").exists() else "yt-dlp"
-MAX_FILE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB
-# ==================
+# ======== FIX ДЛЯ PyCharm =========
+nest_asyncio.apply()
 
+# ======== ТОКЕН =========
+TOKEN = "8071411122:AAE7qfXVzvR-LIhlelQ8RHl0PKpLQF2M4mA"
+
+# ======== Максимальний розмір файлу =========
+MAX_FILE_SIZE = 1900 * 1024 * 1024  # ~1.9 ГБ
+
+# ======== Хендлер /start =========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Привітальне повідомлення"""
     await update.message.reply_text(
-        "👋 Привіт!\n"
-        "Надішли мені посилання з YouTube / TikTok / Instagram — я завантажу відео.\n"
-        "⚠️ Максимальний розмір файлу: 2 GB."
+        "👋 Привіт! Надішли мені посилання на відео з YouTube, TikTok або Instagram, "
+        "і я завантажу його для тебе 🎬\n\n"
+        "📌 Для Instagram відео з обмеженим доступом, переконайся, що у папці бота є файл cookies.txt"
     )
 
-def is_url(text: str) -> bool:
-    """Перевірка, чи є текст URL"""
-    return text.startswith(("http://", "https://"))
+# ======== Завантаження відео =========
+async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    url = update.message.text.strip()
 
-async def download_with_yt_dlp(url: str, out_dir: str) -> Path:
-    """Асинхронне завантаження відео через yt-dlp"""
-    out_template = str(Path(out_dir) / "%(title)s.%(ext)s")
-    cmd = [
-        YTDLP_CMD,
-        url,
-        "-f", "bv*+ba/best",
-        "-o", out_template,
-        "--merge-output-format", "mp4",
-        "--no-playlist",
-        "--quiet",
-        "--no-warnings",
-        "--remux-video", "mp4",
-        "--ffmpeg-location", "ffmpeg",
-        "--extractor-args", "tiktok:player_url=https://www.tiktok.com",
-    ]
+    # Якщо повідомлення не містить посилання — нічого не робимо
+    if not any(x in url for x in ["youtube.com", "youtu.be", "tiktok.com", "instagram.com", "reel/"]):
+        return  # <-- просто ігнор
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"yt-dlp помилка:\n{stderr.decode(errors='ignore').strip() or stdout.decode(errors='ignore')}"
-        )
-
-    files = list(Path(out_dir).glob("*"))
-    if not files:
-        raise FileNotFoundError("Не знайдено завантажених файлів.")
-    return max(files, key=lambda p: p.stat().st_size)
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обробка повідомлень користувача"""
-    msg = update.message
-    text = (msg.text or "").strip()
-    if not text or not is_url(text):
-        await msg.reply_text("Надішли правильне посилання (http/https).")
-        return
-
-    reply = await msg.reply_text("⏳ Завантажую відео...")
-    tmpdir = tempfile.mkdtemp(prefix="tg_dload_")
+    await update.message.reply_text("⏳ Завантажую відео, зачекай трохи...")
 
     try:
-        try:
-            file_path = await download_with_yt_dlp(text, tmpdir)
-        except Exception as e:
-            await reply.edit_text(f"❌ Помилка під час завантаження:\n{e}")
-            return
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ydl_opts = {
+                "outtmpl": os.path.join(tmpdir, "%(title)s.%(ext)s"),
+                "format": "best[height<=720][ext=mp4]/best",  # обмеження 720p для стабільності
+                "quiet": True,
+                "noplaylist": True,
+                "socket_timeout": 300,           # таймаут 5 хвилин
+                "retries": 5,                    # кількість повторів
+                "noprogress": True,
+                "nocheckcertificate": True,
+                "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+                "cookiefile": "cookies.txt",     # Instagram cookies
+            }
 
-        size = file_path.stat().st_size
-        if size > MAX_FILE_BYTES:
-            await reply.edit_text(
-                f"⚠️ Відео занадто велике ({size / 1024 / 1024:.1f} MB > 2 GB).\n"
-                "Telegram не може надіслати такий файл."
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                file_path = ydl.prepare_filename(info)
+
+            # Перевірка розміру файлу
+            if os.path.getsize(file_path) > MAX_FILE_SIZE:
+                await update.message.reply_text(
+                    "⚠️ Відео занадто велике для відправки Telegram (>1.9GB)"
+                )
+                return
+
+            # Відправка відео
+            with open(file_path, "rb") as f:
+                await update.message.reply_video(
+                    video=f, caption=f"✅ {info.get('title', 'Відео')}"
+                )
+
+    except Exception as e:
+        msg = str(e)
+        if "inappropriate" in msg or "unavailable" in msg:
+            await update.message.reply_text(
+                "⚠️ Це відео недоступне для завантаження навіть з cookies (можливо обмеження платформи)."
             )
-            return
+        else:
+            await update.message.reply_text(f"❌ Помилка при завантаженні: {e}")
 
-        await reply.edit_text("📤 Надсилаю відео...")
-        try:
-            with open(file_path, "rb") as f:
-                await msg.reply_video(f, filename=file_path.name, supports_streaming=True)
-        except Exception:
-            with open(file_path, "rb") as f:
-                await msg.reply_document(f, filename=file_path.name)
-
-        await reply.delete()
-
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
+# ======== Головна функція =========
 async def main():
-    """Основна функція запуску бота"""
-    if not TELEGRAM_TOKEN:
-        print("❌ TELEGRAM_TOKEN не задано!")
-        return
+    app = ApplicationBuilder().token(TOKEN).build()
 
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
 
-    print("✅ Бот запущено! Очікую повідомлень...")
+    print("✅ Бот запущено... (натисни Ctrl+C для зупинки)")
     await app.run_polling()
 
-# ===== запуск бота =====
+# ======== Запуск =========
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.get_event_loop().run_until_complete(main())
